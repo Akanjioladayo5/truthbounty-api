@@ -189,4 +189,26 @@ export class CanonicalEventsService {
     // fast in-memory integration test) reports its own constraint code.
     return code === PG_UNIQUE_VIOLATION || code === 'SQLITE_CONSTRAINT';
   }
+
+  /**
+   * Observable quarantine inspection: counts quarantined events that affect correctness.
+   * Blocks readiness or marks indexer unhealthy if unresolvable quarantined anomalies are present.
+   */
+  async getQuarantineCount(chainId?: number): Promise<number> {
+    const qb = this.dataSource.getRepository(EventQuarantine).createQueryBuilder('q');
+    if (chainId) {
+      qb.where('q.chainId = :chainId', { chainId });
+    }
+    return qb.getCount();
+  }
+
+  /**
+   * Checks whether observable quarantine status blocks readiness.
+   * If any quarantined event is present, correctness is affected and readiness fails closed.
+   */
+  async isReadinessBlockedByQuarantine(chainId?: number): Promise<boolean> {
+    const count = await this.getQuarantineCount(chainId);
+    return count > 0;
+  }
 }
+

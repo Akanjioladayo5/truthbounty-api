@@ -27,6 +27,7 @@ import { JobsModule } from './jobs/jobs.module';
 import { CacheModule } from './cache/cache.module';
 import { ClaimsModule } from './claims/claims.module';
 import { ClaimFeedModule } from './claims/v2/claim-feed.module';
+import { ClaimReadModelsModule } from './claims/v2/read-models/claim-read-models.module';
 import { AuditModule } from './audit/audit.module';
 import { ThemeModule } from './theme.module';
 import { SupportModule } from './support/support.module';
@@ -338,6 +339,8 @@ async function createThrottlerStorage(
     CacheModule,
     ClaimsModule,
     ClaimFeedModule,
+    // PREWAVE-BE-005: versioned claim list/detail read models
+    ClaimReadModelsModule,
     AuditModule,
     ThemeModule,
     SupportModule,

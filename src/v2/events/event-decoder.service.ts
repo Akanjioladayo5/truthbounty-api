@@ -30,7 +30,7 @@ function toJsonSafe(value: unknown): unknown {
   return value;
 }
 
-function argsToObject(description: LogDescription): Record<string, unknown> {
+export function argsToObject(description: LogDescription): Record<string, unknown> {
   const out: Record<string, unknown> = {};
   description.fragment.inputs.forEach((input, index) => {
     const name = input.name || `arg${index}`;
