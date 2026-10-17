@@ -13,19 +13,14 @@ import { StartupValidationService } from './startup-validation.service';
 import { DeterministicRpcFailoverService } from './deterministic-rpc-failover.service';
 import { ReadinessService } from './readiness.service';
 import { DependencyProvenanceService } from './dependency-provenance.service';
-import { WebhookSignatureVerifierService } from './webhook-signature-verifier.service';
-import { WebhookDelivery, WebhookSecretRotation } from './webhook-entities';
-import { WebhookReceiverController } from './webhook-receiver.controller';
+import { WebhookSignatureService } from './webhook-signature.service';
+import { WebhookReplayGuardService } from './webhook-replay-guard.service';
+import { WebhookDeliveryEntity } from './entities/webhook-delivery.entity';
+import { WebhookController } from './webhook.controller';
 
 @Module({
   imports: [
-    TypeOrmModule.forFeature([
-      ProcessedEvent,
-      TokenBalance,
-      IndexerCheckpoint,
-      WebhookDelivery,
-      WebhookSecretRotation,
-    ]),
+    TypeOrmModule.forFeature([ProcessedEvent, TokenBalance, IndexerCheckpoint, WebhookDeliveryEntity]),
     SybilResistanceModule,
   ],
   providers: [
@@ -38,9 +33,11 @@ import { WebhookReceiverController } from './webhook-receiver.controller';
     EventIndexingService,
     StartupValidationService,
     DeterministicRpcFailoverService,
-    WebhookSignatureVerifierService,
+    WeightedVoteResolutionService,
+    WebhookSignatureService,
+    WebhookReplayGuardService,
   ],
-  controllers: [BlockchainController, WebhookReceiverController],
+  controllers: [BlockchainController, WebhookController],
   exports: [
     BlockchainIndexerService,
     BlockchainStateService,
@@ -50,7 +47,9 @@ import { WebhookReceiverController } from './webhook-receiver.controller';
     ReconciliationService,
     EventIndexingService,
     DeterministicRpcFailoverService,
-    WebhookSignatureVerifierService,
+    WeightedVoteResolutionService,
+    WebhookSignatureService,
+    WebhookReplayGuardService,
   ],
 })
 export class BlockchainModule {}

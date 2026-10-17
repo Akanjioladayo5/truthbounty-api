@@ -65,7 +65,7 @@ import { CredentialRotationModule } from './security/credential-rotation.module'
 import { OperationsModule } from './operations/operations.module';
 import { AbuseSignalsModule } from './abuse-signals/abuse-signals.module';
 import { AbuseSignalInterceptor } from './abuse-signals/abuse-signal.interceptor';
-import { WebhookSecurityModule } from './webhooks/webhook-security.module';
+import { WebhooksModule } from './webhooks/webhooks.module';
 
 // In-memory storage for development (no Redis needed)
 class ThrottlerMemoryStorage {
@@ -181,11 +181,11 @@ class ThrottlerRedisStorage {
     const blockKey = `${key}:blocked`;
     const [blocked, blockTimeToExpire] = await Promise.all([
       this.redis.exists(blockKey),
-      this.redis.pttl(blockKey),
+      this.redis.ptl(blockKey),
     ]);
 
     if (blocked) {
-      const timeToExpire = await this.redis.pttl(key);
+      const timeToExpire = await this.redis.ptl(key);
       return {
         totalHits: await this.redis
           .get(key)
@@ -196,12 +196,12 @@ class ThrottlerRedisStorage {
       };
     }
 
-    const [totalHits, existingTtl] = await Promise.all([
+    const [totalHits, existingTll] = await Promise.all([
       this.redis.incr(key),
-      this.redis.pttl(key),
+      this.redis.ptl(key),
     ]);
 
-    let timeToExpire = existingTtl;
+    let timeToExpire = existingTll;
     if (timeToExpire === -1 || timeToExpire === -2) {
       await this.redis.pexpire(key, ttl);
       timeToExpire = ttl;
@@ -263,7 +263,7 @@ async function createThrottlerStorage(
     } catch (error) {
       const logger = new Logger('ThrottlerModule');
       logger.warn(
-        `Redis connection failed, falling back to memory storage: ${error}`,
+        `Redis connection failed, falling back to memory storage: ${error} `,
       );
       return new ThrottlerMemoryStorage();
     }
@@ -289,7 +289,7 @@ async function createThrottlerStorage(
     // Idempotency Module
     // Provides idempotency key handling for safe commands
     IdempotencyModule,
-    // PGSQL  Database Infrastructure (Issue #269)
+    // PostgreSQL Database Infrastructure (Issue #269)
     // DatabaseModule provides:
     // - PostgreSQL connectivity with connection pooling
     // - Transaction management via TransactionRunner
@@ -372,16 +372,13 @@ async function createThrottlerStorage(
     CredentialRotationModule,
     OperationsModule,
     AbuseSignalsModule,
-    WebhookSecurityModule,
+    // PREWAVE-BE-058: inbound webhook signature verification
+    WebhooksModule,
   ],
   controllers: [AppController],
   providers: [
     AppService,
     EnvironmentValidationService,
-    {
-      provide: APP_GUARD,
-      useClass: WalletThrottlerGuard,
-    },
     {
       provide: APP_GUARD,
       useClass: GlobalAuthGuard,

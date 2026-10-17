@@ -1,5 +1,17 @@
-import { Controller, Get, Post, Body, Param, Headers, Header, Req, HttpCode, HttpException, Unauthorized } from '@nestjs/common';
+import {
+  Controller,
+  Get,
+  Post,
+  Body,
+  Param,
+  Headers,
+  Req,
+  HttpCode,
+  HttpException,
+  UnauthorizedException,
+} from '@nestjs/common';
 import { ApiTags } from '@nestjs/swagger';
+import { Request } from 'express';
 import { EventIndexingService } from './event-indexing.service';
 import { ReconciliationService } from './reconciliation.service';
 import { BlockchainStateService } from './state.service';
@@ -7,8 +19,6 @@ import { WeightedVoteResolutionService } from './weighted-vote-resolution.servic
 import { ReadinessService } from './readiness.service';
 import { BlockInfo, ResolutionConfig, VerificationVote } from './types';
 import { WebhookSignatureService } from './webhook-signature.service';
-import { RawBody } from '@nestjs/common';
-import { Request } from 'express';
 
 @ApiTags('blockchain')
 @Controller('api/v1/blockchain')
@@ -19,14 +29,14 @@ export class BlockchainController {
     private stateService: BlockchainStateService,
     private voteResolver: WeightedVoteResolutionService,
     private readinessService: ReadinessService,
-    private webhookSignature: WebhookSignatureService,
+    private webhookSignatureService: WebhookSignatureService,
   ) {}
 
   /**
    * Process a new block and its events
    */
   @Post('blocks/process')
-  async processBloch(
+  async processBlock(
     @Body()
     payload: {
       block: BlockInfo;
@@ -43,51 +53,41 @@ export class BlockchainController {
   }
 
   /**
-   * Receive a signed inbound webhook from a blockchain provider.
-   *
-   * The raw request body is preserved and verified against provider-specific
-   * signed bytes. Replays, duplicate delivery IDs, oversized bodies, and unknown
-   * providers fail closed.
+   * Receive and verify an inbound provider webhook.
+   * Raw signed bytes are preserved via raw body parsing and verified before
+   * any deserialization or side effect. Replays are rejected transactionally.
    */
   @Post('webhooks/:provider')
-  @HttpCode(202)
+  @HttpCode(200)
   async handleWebhook(
     @Param('provider') provider: string,
     @Headers() headers: Record<string, string | string[] | undefined>,
-    @RawBody() rawBody: Buffer,
     @Req() req: Request,
   ) {
-    const verification = await this.webhookSignature.verifyAndRegister({
-      provider,
-      headers,
-      rawBody,
-      remoteAddress: req.ip,
-    });
+    const rawBody: Buffer = Buffer.isBuffer(req.body)
+      ? req.body
+      : Buffer.from(req.body === undefined ? '' : String(req.body), 'utf8');
 
-    if (!verification.ok) {
-      throw new HttpException(
-        verification.status ?? 400,
-        verification.reason ?? 'Webhook verification failed',
+    try {
+      const result = await this.webhookSignatureService.verifyAndIngest(
+        provider,
+        headers,
+        rawBody,
       );
+
+      return {
+        success: true,
+        provider,
+        deliveryId: result.deliveryId,
+        received: true,
+      };
+    } catch (error) {
+      // Fail closed. Never leak secrets or signature details in responses or logs.
+      if (error instanceof HttpException) {
+        throw error;
+      }
+      throw new UnauthorizedException('Webhook rejected');
     }
-
-    const payload = verification.payload as {
-      block?: BlockInfo;
-      events?: any[];
-    } | undefined;
-
-    if (!payload || !payload.block || !Array.isArray(payload.events)) {
-      throw new HttpException(400, 'Invalid webhook payload');
-    }
-
-    await this.eventIndexing.processBlock(payload.block, payload.events);
-
-    return {
-      success: true,
-      provider,
-      deliveryId: verification.deliveryId,
-      blockNumber: payload.block.number,
-    };
   }
 
   /**
