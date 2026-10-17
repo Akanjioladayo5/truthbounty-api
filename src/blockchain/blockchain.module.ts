@@ -13,10 +13,19 @@ import { StartupValidationService } from './startup-validation.service';
 import { DeterministicRpcFailoverService } from './deterministic-rpc-failover.service';
 import { ReadinessService } from './readiness.service';
 import { DependencyProvenanceService } from './dependency-provenance.service';
+import { WebhookSignatureVerifierService } from './webhook-signature-verifier.service';
+import { WebhookDelivery, WebhookSecretRotation } from './webhook-entities';
+import { WebhookReceiverController } from './webhook-receiver.controller';
 
 @Module({
   imports: [
-    TypeOrmModule.forFeature([ProcessedEvent, TokenBalance, IndexerCheckpoint]),
+    TypeOrmModule.forFeature([
+      ProcessedEvent,
+      TokenBalance,
+      IndexerCheckpoint,
+      WebhookDelivery,
+      WebhookSecretRotation,
+    ]),
     SybilResistanceModule,
   ],
   providers: [
@@ -29,8 +38,9 @@ import { DependencyProvenanceService } from './dependency-provenance.service';
     EventIndexingService,
     StartupValidationService,
     DeterministicRpcFailoverService,
+    WebhookSignatureVerifierService,
   ],
-  controllers: [BlockchainController],
+  controllers: [BlockchainController, WebhookReceiverController],
   exports: [
     BlockchainIndexerService,
     BlockchainStateService,
@@ -40,6 +50,7 @@ import { DependencyProvenanceService } from './dependency-provenance.service';
     ReconciliationService,
     EventIndexingService,
     DeterministicRpcFailoverService,
+    WebhookSignatureVerifierService,
   ],
 })
 export class BlockchainModule {}

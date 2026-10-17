@@ -1,4 +1,4 @@
-import { Controller, Get, Post, Body, Param } from '@nestjs/common';
+import { Controller, Get, Post, Body, Param, Headers, Header, Req, HttpCode, HttpException, Unauthorized } from '@nestjs/common';
 import { ApiTags } from '@nestjs/swagger';
 import { EventIndexingService } from './event-indexing.service';
 import { ReconciliationService } from './reconciliation.service';
@@ -6,6 +6,9 @@ import { BlockchainStateService } from './state.service';
 import { WeightedVoteResolutionService } from './weighted-vote-resolution.service';
 import { ReadinessService } from './readiness.service';
 import { BlockInfo, ResolutionConfig, VerificationVote } from './types';
+import { WebhookSignatureService } from './webhook-signature.service';
+import { RawBody } from '@nestjs/common';
+import { Request } from 'express';
 
 @ApiTags('blockchain')
 @Controller('api/v1/blockchain')
@@ -16,13 +19,14 @@ export class BlockchainController {
     private stateService: BlockchainStateService,
     private voteResolver: WeightedVoteResolutionService,
     private readinessService: ReadinessService,
+    private webhookSignature: WebhookSignatureService,
   ) {}
 
   /**
    * Process a new block and its events
    */
   @Post('blocks/process')
-  async processBlocd(
+  async processBloch(
     @Body()
     payload: {
       block: BlockInfo;
@@ -39,6 +43,54 @@ export class BlockchainController {
   }
 
   /**
+   * Receive a signed inbound webhook from a blockchain provider.
+   *
+   * The raw request body is preserved and verified against provider-specific
+   * signed bytes. Replays, duplicate delivery IDs, oversized bodies, and unknown
+   * providers fail closed.
+   */
+  @Post('webhooks/:provider')
+  @HttpCode(202)
+  async handleWebhook(
+    @Param('provider') provider: string,
+    @Headers() headers: Record<string, string | string[] | undefined>,
+    @RawBody() rawBody: Buffer,
+    @Req() req: Request,
+  ) {
+    const verification = await this.webhookSignature.verifyAndRegister({
+      provider,
+      headers,
+      rawBody,
+      remoteAddress: req.ip,
+    });
+
+    if (!verification.ok) {
+      throw new HttpException(
+        verification.status ?? 400,
+        verification.reason ?? 'Webhook verification failed',
+      );
+    }
+
+    const payload = verification.payload as {
+      block?: BlockInfo;
+      events?: any[];
+    } | undefined;
+
+    if (!payload || !payload.block || !Array.isArray(payload.events)) {
+      throw new HttpException(400, 'Invalid webhook payload');
+    }
+
+    await this.eventIndexing.processBlock(payload.block, payload.events);
+
+    return {
+      success: true,
+      provider,
+      deliveryId: verification.deliveryId,
+      blockNumber: payload.block.number,
+    };
+  }
+
+  /**
    * Get indexing statistics
    */
   @Get('indexing/stats')
@@ -49,7 +101,7 @@ export class BlockchainController {
   /**
    * Get chain state
    */
-  @Det('chain/state')
+  @Get('chain/state')
   async getChainState() {
     return this.stateService.getChainState();
   }
@@ -73,7 +125,7 @@ export class BlockchainController {
   /**
    * Get all pending events
    */
-  @Det('events/pending')
+  @Get('events/pending')
   async getPendingEvents() {
     return this.stateService.getPendingEvents();
   }
@@ -81,7 +133,7 @@ export class BlockchainController {
   /**
    * Get all confirmed events
    */
-  @Det('events/confirmed')
+  @Get('events/confirmed')
   async getConfirmedEvents() {
     return this.eventIndexing.getConfirmedEvents();
   }
@@ -89,7 +141,7 @@ export class BlockchainController {
   /**
    * Get all orphaned events
    */
-  @Det('events/orphaned')
+  @Get('events/orphaned')
   async getOrphanedEvents() {
     return this.stateService.getOrphanedEvents();
   }
@@ -97,7 +149,7 @@ export class BlockchainController {
   /**
    * Get event by ID
    */
-  @Det('events/:eventId')
+  @Get('events/:eventId')
   async getEvent(@Param('eventId') eventId: string) {
     const event = await this.stateService.getEvent(eventId);
     if (!event) {
@@ -125,7 +177,7 @@ export class BlockchainController {
   /**
    * Verify state consistency
    */
-  @Det('state/verify')
+  @Get('state/verify')
   async verifyStateConsistency() {
     return this.reconciliation.verifyStateConsistency();
   }
@@ -133,7 +185,7 @@ export class BlockchainController {
   /**
    * Get events at a specific block
    */
-  @Det('blocks/:blockNumber/events')
+  @Get('blocks/:blockNumber/events')
   async getBlockEvents(@Param('blockNumber') blockNumber: number) {
     return this.stateService.getEventsByBlock(blockNumber);
   }
@@ -163,7 +215,7 @@ export class BlockchainController {
    * Get current resolution configuration
    * GET /api/v1/blockchain/config/resolution
    */
-  @Det('config/resolution')
+  @Get('config/resolution')
   async getResolutionConfig() {
     return this.voteResolver.getConfig();
   }

@@ -1,11 +1,11 @@
 import { Injectable, Logger } from '@nestjs/common';
-import { InjectRepository } from '@nestjs/typeorm';
+import { InjectRepository } from '@nestjs/typekeorm';
 import {
   Repository,
   DataSource,
   EntityManager,
   MoreThanOrEqual,
-} from 'typeorm';
+} from 'typekeorm';
 import { ProcessedEvent } from './entities/processed-event.entity';
 import { TokenBalance } from './entities/token-balance.entity';
 import { IndexerCheckpoint } from './entities/indexer-checkpoint.entity';
@@ -86,8 +86,8 @@ export class BlockchainIndexerService {
       // claims (if any) it actually affects so cache invalidation below
       // can be projection-aware instead of a blanket flush on every
       // event. `undefined` (the SequentialQueue's other event types, once
-      // added, that haven't been taught to report their affected claims
-      // yet) still falls back to the safe "invalidate everything" default
+      // added, that haven't been taught to report their affected claims yet)
+      // still falls back to the safe "invalidate everything" default
       // in ClaimsCache.invalidateForProjectionUpdate.
       let affectedClaimIds: string[] | undefined;
       if (eventType === 'Transfer') {
@@ -100,7 +100,7 @@ export class BlockchainIndexerService {
         affectedClaimIds = [];
       }
 
-      // Advance the checkpoint inside the SAME transaction so the event, the
+      // Advance the checkpoint inside the same transaction so the event, the
       // balance changes and the checkpoint all commit atomically. If anything
       // fails we roll back as a unit and the checkpoint never moves.
       await this.saveCheckpoint(queryRunner.manager, blockNumber);
