@@ -1,7 +1,13 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { ethers } from 'ethers';
+import { ethers } from 'ethers/';
+
 import { ContractConfig } from '../config/event-indexer.config';
+import {
+  CanonicalReleaseManifest,
+  ReleaseManifestContract,
+  ReleaseManifestAdapter,
+} from '../config/release-manifest.adapter';
 
 /**
  * Result of validating a single contract config at startup.
@@ -14,12 +20,108 @@ export interface ContractValidationResult {
 }
 
 /**
+ * Result of validating the canonical release manifest at startup.
+ */
+export interface ReleaseManifestValidationResult {
+  releaseId: string;
+  chainId: number;
+  deploymentBlock: number;
+  contracts: ReleaseManifestContract[];
+  manifestAgeMs: number;
+}
+
+/**
+ * Environment modes that determine fail-closed behaviour.
+ */
+export type EnvironmentMode = 'local' | 'development' |
+  'test' | 'staging' | 'production';
+
+/**
+ * Readiness status separated from liveness and startup.
+ */
+export type ReadinessStatus =
+  | 'starting'
+  | 'healthy'
+  | 'degraded'
+  | 'unready';
+
+/**
+ * Liveness is independent of readiness and dependency provenance.
+ */
+export type LivenessStatus = 'alive' | 'dead';
+
+/**
+ * Per-dependency provenance recorded at observation time.
+ */
+export interface DependencyProvenance {
+  name: string;
+  required: boolean;
+  observedAt: number | null;
+  lastSuccessAt: number | null;
+  lastSuccessOk: boolean;
+  stale: boolean;
+  detail?: string;
+}
+
+/**
+ * Readiness observation snapshot.
+ */
+export interface ReadinessObservation {
+  observedAt: number;
+  lastSuccessAt: number | null;
+  chainId: number | null;
+  chainHead: number | null;
+  finalizedBlock: number | null;
+  projectionLagBlocks: number | null;
+  releaseId: string | null;
+  deploymentBlock: number | null;
+  artifactChecksum: string | null;
+  dependencies: DependencyProvenance[];
+}
+
+/**
+ * Sanitized public status shape. Never leaks internal details, error
+ * strings, or addresses.
+ */
+export interface PublicReadinessStatus {
+  status: ReadinessStatus;
+  liveness: LivenessStatus;
+  observedAt: number | null;
+  lastSuccessAgeMs: number | null;
+  releaseId: string | null;
+  chainId: number | null;
+  dependencies: Array<{ name: string; ok: boolean; stale: boolean }>;
+}
+
+/**
+ * Readiness thresholds.
+ */
+export interface ReadinessPolicy {
+  maxSuccessAgeMs: number;
+  maxRpcLagBlocks: number;
+  maxProjectionLagBlocks: number;
+}
+
+/**
  * Validates chain, contract address and ABI configuration at startup,
  * before the indexer begins consuming blocks.
  *
  * This is "V2-BE-009 — validate chain/addresses/ABIs at startup": catch
  * misconfigurations early and fail fast (fail-closed) rather than emitting
  * garbage into the indexer or routing to the wrong chain.
+ *
+ * Stab-BE-007 extends this to consume the versioned canonical contract
+ * release manifest rather than hand-maintained addresses/events, and to
+ * validate chain ID, release ID, deployment block, addresses, ABI/event
+ * checksums and manifest age. It fails closed in staging/production when
+ * required release data is absent or inconsistent, and keeps local dev
+ * explicit and visibly non-production.
+ *
+ * PREWAVE-BE-044 extends this with runtime readiness observations: observed
+ * time, last success, chain head/finalized block, projection lag,
+ * release and per-dependency provenance. Liveness, startup, readiness and
+ * degraded status are separated and fail closed on stale, ambiguous,
+ * missing or unauthorized state.
  *
  * Address validation is *pure* (checksum + shape). RPC/chain-id and
  * contract-code checks require a network round trip and are only performed
@@ -31,7 +133,19 @@ export interface ContractValidationResult {
 export class StartupValidationService {
   private readonly logger = new Logger(StartupValidationService.name);
 
-  constructor(private readonly configService: ConfigService) {}
+  /** Latest readiness observation, if any. */
+  private readinessObservation: ReadinessObservation | null = null;
+
+  /** Startup completion timestamp (null until startup validation passes). */
+  private startupCompletedAt: number | null = null;
+
+  /** Liveness signal, independent of readiness. */
+  private livenessAlive = true;
+
+  constructor(
+    private readonly configService: ConfigService,
+    private readonly releaseManifestAdapter: ReleaseManifestAdapter,
+  ) {}
 
   /**
    * Entry point invoked on application bootstrap. Throws (fail-closed) if
@@ -40,21 +154,40 @@ export class StartupValidationService {
   async onApplicationBootstrap(): Promise<void> {
     if (this.configService.get('BLOCKCHAIN_STARTUP_VALIDATION') === 'false') {
       this.logger.warn('Blockchain startup validation disabled by config');
+      this.startupCompletedAt = Date.now();
       return;
     }
 
+    const envManifest = this.releaseManifestAdapter.load();
+    const isLocal = this.isLocalMode();
+
     const errors: string[] = [];
 
+    // 1. Release manifest validation (fail-closed outside local).
+    errors.push(...this.validateReleaseManifest(envManifest, isLocal));
+
+    // 2. Contract config validation.
     const contracts = this.getContracts();
+    if (contracts.length === 0 && !isLocal) {
+      errors.push(
+        'INDEXED_CONTRACTS, is empty; indexer configuration cannot start outside explicit local mode',
+      );
+    }
     for (const contract of contracts) {
       const result = this.validateContract(contract);
       if (!result.valid) {
         errors.push(
-          `Contract "${result.name}" (${result.address}) invalid: ${result.errors.join('; ')}`,
+          `Contract "${result.name}" (${result.address}) address invalid: ${result.errors.join('; ')}`,
         );
       }
     }
 
+    // 3. Release manifest <-> contract config consistency.
+    if (envManifest) {
+      errors.push(...this.validateManifestConsistency(envManifest, contracts));
+    }
+
+    // 4. Network-backed checks.
     if (this.configService.get('BLOCKCHAIN_STARTUP_RPC_CHECK') !== 'false') {
       errors.push(...(await this.validateChainAndCode(contracts)));
     }
@@ -67,8 +200,10 @@ export class StartupValidationService {
       throw new Error(msg);
     }
 
+    this.startupCompletedAt = Date.now();
+    const releaseId = envManifest?.releaseId ?? 'unknown';
     this.logger.log(
-      `Blockchain startup validation passed (${contracts.length} contracts, ABI/address checks ok)`,
+      `Blockchain startup validation passed (release=${releaseId}, ${contracts.length} contracts, ABI/address checks ok)`,
     );
   }
 
@@ -81,7 +216,7 @@ export class StartupValidationService {
 
     if (!contract.address) {
       errors.push('missing address');
-    } else if (!/^0x[a-fA-F0-9]{40}$/.test(contract.address)) {
+    } else if (!/^0x[aA-fA-F0-9]{40}$/.test(contract.address)) {
       errors.push(`address "${contract.address}" is not a valid 20-byte hex`);
     } else {
       try {
@@ -128,67 +263,337 @@ export class StartupValidationService {
     };
   }
 
-  private getContracts(): ContractConfig[] {
-    const raw = this.configService.get<string>('INDEXED_CONTRACTS', '[]');
-    try {
-      const parsed: unknown = JSON.parse(raw);
-      return Array.isArray(parsed) ? (parsed as ContractConfig[]) : [];
-    } catch {
-      return [];
+  /**
+   * Validate the canonical release manifest against the configured chain
+   * and manifest age. Fails closed outside local mode.
+   */
+  validateReleaseManifest(
+    manifest: CanonicalReleaseManifest | null,
+    isLocal: boolean,
+  ): string[] {
+    const errors: string[] = [];
+
+    if (!manifest) {
+      if (!isLocal) {
+        errors.push(
+          'Canonical release manifest is missing or unreadable; required outside local mode',
+        );
+      }
+      return errors;
     }
+
+    // Release ID must be a non-empty string.
+    if (!manifest.releaseId || typeof manifest.releaseId !== 'string') {
+      errors.push('Release manifest is missing a valid releaseId');
+    }
+
+    // Chain ID must match the configured chain ID.
+    const configuredChainId = this.configService.get<number>('blockchain.chainId');
+    if (configuredChainId !== undefined && configuredChainId !== null) {
+      if (Number(manifest.chainId) !== Number(configuredChainId)) {
+        errors.push(
+          `Release manifest chainId (${manifest.chainId}) does not match configured chainId (${configuredChainId})`,
+        );
+      }
+    } else if (!isLocal) {
+      errors.push('blockchain.chainId is not configured');
+    }
+
+    // Deployment block must be a non-negative integer.
+    if (
+      typeof manifest.deploymentBlock !== 'number' ||
+      !Number.isInteger(manifest.deploymentBlock) ||
+      manifest.deploymentBlock < 0
+    ) {
+      errors.push('Release manifest is missing a valid deploymentBlock');
+    }
+
+    // Manifest age must be within the configured maximum.
+    const maxAgeMs = this.getMaxManifestAgeMs();
+    const ageMs = this.getManifestAgeMs(manifest);
+    if (ageMs !== null && ageMs > maxAgeMs) {
+      errors.push(
+        `Release manifest is stale (age ${ageMs}ms > max ${maxAgeMs}ms)`,
+      );
+    }
+
+    // Artifact checksum must be present outside local mode.
+    if (!isLocal && !manifest.artifactChecksum) {
+      errors.push('Release manifest is missing an artifactChecksum');
+    }
+
+    return errors;
   }
 
   /**
-   * Network-backed checks: RPC reachability, chain-id match and contract-code
-   * presence. Only when enabled (fail-closed default).
+   * Validate that the release manifest and the contract config agree.
    */
-  private async validateChainAndCode(
+  validateManifestConsistency(
+    manifest: CanonicalReleaseManifest,
     contracts: ContractConfig[],
-  ): Promise<string[]> {
+  ): string[] {
     const errors: string[] = [];
-    const rpcUrl = this.configService.get<string>('blockchain.rpcUrl');
-    const expectedChainId =
-      this.configService.get<number>('blockchain.chainId');
+    const manifestContracts = Array.isArray(manifest.contracts)
+      ? manifest.contracts
+      : [];
 
-    if (!rpcUrl || !expectedChainId) {
-      errors.push(
-        'blockchain.rpcUrl and blockchain.chainId must be configured for RPC validation',
-      );
-      return errors;
-    }
-
-    let provider: ethers.JsonRpcProvider;
-    try {
-      provider = new ethers.JsonRpcProvider(rpcUrl);
-      const network = await provider.getNetwork();
-      if (network.chainId !== BigInt(expectedChainId)) {
-        errors.push(
-          `RPC chain id ${network.chainId} does not match configured CHAIN_ID ${expectedChainId}`,
-        );
+    const byName = new Map<string, ReleaseManifestContract>();
+    for (const mc of manifestContracts) {
+      if (!mc.name) {
+        errors.push('Release manifest contains a contract without a name');
+        continue;
       }
-    } catch (err) {
-      errors.push(`RPC unreachable at ${rpcUrl}: ${String(err)}`);
-      return errors;
+      if (byName.has(mc.name)) {
+        errors.push(`Release manifest declares duplicate contract "${mc.name}"`);
+        continue;
+      }
+      byName.set(mc.name, mc);
     }
 
     for (const contract of contracts) {
-      if (!/^0x[a-fA-F0-9]{40}$/.test(contract.address)) {
+      const name = contract.name ?? contract.address;
+      const mc = byName.get(name);
+      if (!mc) {
+        errors.push(`Contract "${name}" is not declared in the release manifest`);
         continue;
       }
-      try {
-        const code = await provider.getCode(contract.address);
-        if (!code || code === '0x' || code === '0x0') {
-          errors.push(
-            `no contract deployed at ${contract.address} (${contract.name})`,
-          );
-        }
-      } catch (err) {
+      if (mc.address && contract.address && mc.address.toLowerCase() !== contract.address.toLowerCase()) {
         errors.push(
-          `failed to read code at ${contract.address}: ${String(err)}`,
+          `Contract "${name}" address (${contract.address}) does not match release manifest (${mc.address})`,
         );
       }
     }
 
     return errors;
+  }
+
+  /**
+   * Network-backed chain ID and contract code checks.
+   */
+  private async validateChainAndCode(contracts: ContractConfig[]): Promise<string[]> {
+    const errors: string[] = [];
+    const rpcUrl = this.configService.get<string>('blockchain.rpcUrl');
+    if (!rpcUrl) {
+      errors.push('blockchain.rpcUrl is not configured');
+      return errors;
+    }
+
+    try {
+      const provider = new ethers.JsonRpcProvider(rpcUrl);
+      const network = await provider.getNetwork();
+      const configuredChainId = this.configService.get<number>('blockchain.chainId');
+      if (configuredChainId !== undefined && configuredChainId !== null) {
+        if (Number(network.chainId) !== Number(configuredChainId)) {
+          errors.push(
+            `RPC chainId (${network.chainId}) does not match configured chainId (${configuredChainId})`,
+          );
+        }
+      }
+
+      for (const contract of contracts) {
+        if (!contract.address) {
+          continue;
+        }
+        const code = await provider.getCode(contract.address);
+        if (!code || code === '0x') {
+          errors.push(
+            `Contract "${contract.name ?? contract.address}" has no code at ${contract.address}`,
+          );
+        }
+      }
+    } catch (err) {
+      errors.push(`RPC validation failed: ${String(err)}`);
+    }
+
+    return errors;
+  }
+
+  /**
+   * Record a readiness observation. The observation is treated as a
+   * successful observation only when all required dependencies are ok and
+   * the chain/projection lags are within policy.
+   */
+  recordReadinessObservation(observation: ReadinessObservation): void {
+    this.readinessObservation = observation;
+  }
+
+  /**
+   * Mark the service as live or dead. Liveness is independent of
+   * readiness and dependency provenance.
+   */
+  setLiveness(alive: boolean): void {
+    this.livenessAlive = alive;
+  }
+
+  /**
+   * Compute the current readiness status from the latest observation.
+   * Fails closed on stale, ambiguous, missing or unauthorized state.
+   */
+  getReadinessStatus(now: number = Date.now()): ReadinessStatus {
+    if (this.startupCompletedAt === null) {
+      return 'starting';
+    }
+
+    const obs = this.readinessObservation;
+    if (!obs) {
+      return 'unready';
+    }
+
+    const policy = this.getReadinessPolicy();
+
+    // A stale last-success cannot report healthy.
+    if (obs.lastSuccessAt === null) {
+      return 'unready';
+    }
+    const successAgeMs = now - obs.lastSuccessAt;
+    if (successAgeMs > policy.maxSuccessAgeMs) {
+      return 'unready';
+    }
+
+    // Required dependency failure removes readiness.
+    for (const dep of obs.dependencies) {
+      if (dep.required && (!dep.lastSuccessOk || dep.stale)) {
+        return 'unready';
+      }
+    }
+
+    // Chain-derived data must be bound to chain ID and release ID.
+    const configuredChainId = this.configService.get<number>('blockchain.chainId');
+    if (configuredChainId !== undefined && configuredChainId !== null) {
+      if (obs.chainId === null || Number(obs.chainId) !== Number(configuredChainId)) {
+        return 'unready';
+      }
+    } else if (obs.chainId === null) {
+      return 'unready';
+    }
+
+    if (!obs.releaseId) {
+      return 'unready';
+    }
+
+    // Degraded if lAG thresholds are exceeded but required deps are ok.
+    if (
+      obs.chainHead === null ||
+      obs.finalizedBlock === null ||
+      obs.projectionLagBlocks === null
+    ) {
+      return 'degraded';
+    }
+
+    const rpcLag = obs.chainHead - obs.finalizedBlock;
+    if (rpcLag > policy.maxRpcLagBlocks) {
+      return 'degraded';
+    }
+    if (obs.projectionLagBlocks > policy.maxProjectionLagBlocks) {
+      return 'degraded';
+    }
+
+    return 'healthy';
+  }
+
+  /**
+   * Return a sanitized public status. Never leaks internal details,
+   * error strings, or addresses.
+   */
+  getPublicStatus(now: number = Date.now()): PublicReadinessStatus {
+    const obs = this.readinessObservation;
+    const status = this.getReadinessStatus(now);
+    const lastSuccessAgeMs =
+      obs && obs.lastSuccessAt !== null
+        ? now - obs.lastSuccessAt
+        : null;
+
+    return {
+      status,
+      liveness: this.livenessAlive ? 'alive' : 'dead',
+      observedAt: obs ? obs.observedAt : null,
+      lastSuccessAgeMs,
+      releaseId: obs ? obs.releaseId : null,
+      chainId: obs ? obs.chainId : null,
+      dependencies: obs
+        ? obs.dependencies.map((d) => ({
+            name: d.name,
+            ok: d.lastSuccessOk,
+            stale: d.stale,
+          }))
+        : [],
+    };
+  }
+
+  /**
+   * Readiness policy derived from configuration with safe defaults.
+   */
+  getReadinessPolicy(): ReadinessPolicy {
+    return {
+      maxSuccessAgeMs: this.getNumericConfig(
+        'BLOCKCHAIN_READINESS_MAX_SUCCESS_AGE_MS',
+        60_000,
+      ),
+      maxRpcLagBlocks: this.getNumericConfig(
+        'BLOCKCHAIN_READINESS_MAX_RPC_LAG_BLOCKS',
+        5,
+      ),
+      maxProjectionLagBlocks: this.getNumericConfig(
+        'BLOCKCHAIN_READINESS_MAX_PROJECTION_LAG_BLOCKS',
+        20,
+      ),
+    };
+  }
+
+  /**
+   * Return true if startup validation has completed successfully.
+   */
+  isStartupComplete(): boolean {
+    return this.startupCompletedAt !== null;
+  }
+
+  /**
+   * Return true if the service is live.
+   */
+  isLive(): boolean {
+    return this.livenessAlive;
+  }
+
+  private isLocalMode(): boolean {
+    const env = (this.configService.get<string>('NODE_ENV') ?? '').toLowerCase();
+    return env === 'local' || env === 'development';
+  }
+
+  private getContracts(): ContractConfig[] {
+    const configured = this.configService.get<ContractConfig[]>(
+      'blockchain.contracts',
+    );
+    return Array.isArray(configured) ? configured : [];
+  }
+
+  private getMaxManifestAgeMs(): number {
+    return this.getNumericConfig(
+      'BLOCKCHAIN_RELEASE_MANIFEST_MAX_AGE_MS',
+      30 * 24 * 60 * 60 * 1000,
+    );
+  }
+
+  private getManifestAgeMs(manifest: CanonicalReleaseManifest): number | null {
+    const generatedAt = (manifest as unknown as { generatedAt?: unknown })
+      .generatedAt;
+    if (typeof generatedAt === 'number' && Number.isFinite(generatedAt)) {
+      return Date.now() - generatedAt;
+    }
+    if (typeof generatedAt === 'string') {
+      const parsed = Date.parse(generatedAt);
+      if (!Number.isNaN(parsed)) {
+        return Date.now() - parsed;
+      }
+    }
+    return null;
+  }
+
+  private getNumericConfig(key: string, defaultValue: number): number {
+    const raw = this.configService.get<string | number>(key);
+    if (raw === undefined || raw === null || raw === '') {
+      return defaultValue;
+    }
+    const parsed = Number(raw);
+    return Number.isFinite(parsed) && parsed >= 0 ? parsed : defaultValue;
   }
 }
