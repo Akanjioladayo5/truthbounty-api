@@ -4,12 +4,8 @@ import { Repository } from 'typeorm';
 import { NotificationPreference } from '../entities/notification-preference.entity';
 import { DeliveryChannel } from '../interfaces/notification.types';
 import { EventType } from '../enums/event-type.enum';
-import {
-  parseDeliveryChannel,
-  normalizeChannelPreferences,
-  createDefaultChannelPreferences,
-} from '../delivery/delivery-channel';
-import * as moment from 'moment-timezone';
+
+const QUIET_HOURS_TIME_PATTERN = /^([01]\d|2[0-3]):([0-5]\d)$/;
 
 /**
  * PreferenceEnforcer
@@ -107,24 +103,68 @@ export class PreferenceEnforcer {
     }
 
     try {
-      const userTz = timezone || 'UTC';
-      const now = moment().tz(userTz);
-      const [startHour, startMin] = startTime.split(':').map(Number);
-      const [endHour, endMin] = endTime.split(':').map(Number);
+      const start = this.parseQuietHoursTime(startTime);
+      const end = this.parseQuietHoursTime(endTime);
 
-      const start = now.clone().hour(startHour).minute(startMin).second(0);
-      const end = now.clone().hour(endHour).minute(endMin).second(0);
-
-      // Handle overnight quiet hours (e.g., 22:00 to 08:00)
-      if (end.isBefore(start)) {
-        return now.isAfter(start) || now.isBefore(end);
+      if (start === null || end === null) {
+        this.logger.warn(
+          `Invalid quiet hours time for user ${userId}: ${startTime}-${endTime}`,
+        );
+        return false;
       }
 
-      return now.isBetween(start, end);
+      let nowMinutes: number;
+      try {
+        nowMinutes = this.getMinutesOfDay(new Date(), timezone || 'UTC');
+      } catch {
+        const fallbackTz = 'UTC';
+        this.logger.warn(
+          `Invalid quiet hours timezone '${timezone}' for user ${userId}, falling back to ${fallbackTz}`,
+        );
+        nowMinutes = this.getMinutesOfDay(new Date(), fallbackTz);
+      }
+
+      // Handle overnight quiet hours (e.g., 22:00 - 08:00)
+      if (start > end) {
+        return nowMinutes >= start || nowMinutes < end;
+      }
+
+      return nowMinutes >= start && nowMinutes <= end;
     } catch (error) {
       this.logger.error(`Error calculating quiet hours: ${error.message}`);
       return false; // Default to allowing notifications if timezone invalid
     }
+  }
+
+  private parseQuietHoursTime(value: string): number | null {
+    const match = QUIET_HOURS_TIME_PATTERN.exec(value);
+    if (!match) {
+      return null;
+    }
+    return parseInt(match[1], 10) * 60 + parseInt(match[2], 10);
+  }
+
+  private getMinutesOfDay(date: Date, timeZone: string): number {
+    const parts = new Intl.DateTimeFormat('en-US', {
+      timeZone,
+      hourCycle: 'h23',
+      hour: '2-digit',
+      minute: '2-digit',
+    }).formatToParts(date);
+
+    const hourPart = parts.find((part) => part.type === 'hour');
+    const minutePart = parts.find((part) => part.type === 'minute');
+
+    const hour = Number(hourPart?.value);
+    const minute = Number(minutePart?.value);
+
+    if (!Number.isFinite(hour) || !Number.isFinite(minute)) {
+      throw new Error(
+        `Unable to read wall-clock time in timezone '${timeZone}'`,
+      );
+    }
+
+    return (hour % 24) * 60 + minute;
   }
 
   /**
