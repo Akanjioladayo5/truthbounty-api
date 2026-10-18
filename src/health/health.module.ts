@@ -18,6 +18,8 @@ import {
   loadPublicStatusOptions,
 } from './public-status/public-status.options';
 
+import { PublicIncidentsModule } from './public-incidents/public-incidents.module';
+
 @Module({
   imports: [
     DatabaseModule,
@@ -40,6 +42,6 @@ import {
     },
   ],
   controllers: [HealthController, PublicStatusController],
-  exports: [HealthService],
+  exports: [HealthService, PublicIncidentsModule],
 })
 export class HealthModule {}
