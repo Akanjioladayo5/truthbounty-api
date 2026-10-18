@@ -8,6 +8,7 @@ import {
 import { Reflector } from '@nestjs/core';
 import { ConfigService } from '@nestjs/config';
 import { RedisService } from '../redis/redis.service';
+import { createHmac, timingSafeEqual, randomBytes } from 'crypto';
 
 /**
  * Authorization Policy Service
@@ -17,6 +18,9 @@ import { RedisService } from '../redis/redis.service';
  *
  * Implements V2-BE-066: Enforce Least-Privilege API Authorization Policies
  * Implements PREWAVE-BE-035: Validate Realtime Configuration and Topic Authorization
+ *
+ * Also implements PREWAVE-BE-082: Issue Short-Lived Capability Tokens
+ * for Protected Operations.
  */
 
 export enum ResourceType {
@@ -163,6 +167,93 @@ export class RealtimeConfigurationError extends Error {
     this.name = 'RealtimeConfigurationError';
   }
 }
+
+/**
+ * Capability Token contract (PREWAVE-BE-082).
+ *
+ * A capability token is a signed, short-lived, audience-bound assertion
+ * that a given subject may perform a specific capability against a specific
+ * resource scope, for a specific chain/release/deployment/artifact context.
+ */
+export interface CapabilityTokenClaims {
+  /** Token format version */
+  ver: 1;
+  /** Audience the token is issued for (e.g. service identifier) */
+  aud: string;
+  /** Subject (actor) the token is issued to */
+  sub: string;
+  /** Capability being granted */
+  cap: string;
+  /** Resource type scope */
+  resource: ResourceType;
+  /** Optional specific resource identifier */
+  resourceId?: string;
+  /** Action being authorized */
+  action: ActionType;
+  /** Unique nonce for replay protection */
+  nonce: string;
+  /** Issuance time (unix seconds) */
+  iat: number;
+  /** Expiry time (unix seconds) */
+  exp: number;
+  /** Chain context */
+  chain: string;
+  /** Release context */
+  release: string;
+  /** Deployment context */
+  deployment: string;
+  /** Artifact provenance digest */
+  artifact: string;
+}
+
+export interface CapabilityToken {
+  claims: CapabilityTokenClaims;
+  signature: string;
+}
+
+export interface CapabilityIssueRequest {
+  aud: string;
+  sub: string;
+  cap: string;
+  resource: ResourceType;
+  resourceId?: string;
+  action: ActionType;
+  ttlSeconds?: number;
+  chain?: string;
+  release?: string;
+  deployment?: string;
+  artifact?: string;
+}
+
+export interface CapabilityUseRequest {
+  token: CapabilityToken;
+  aud: string;
+  sub: string;
+  cap: string;
+  resource: ResourceType;
+  resourceId?: string;
+  action: ActionType;
+  chain?: string;
+  release?: string;
+  deployment?: string;
+  artifact?: string;
+}
+
+export class CapabilityTokenError extends Error {
+  constructor(
+    readonly code: string,
+    message: string,
+  ) {
+    super(message);
+    this.name = 'CapabilityTokenError';
+  }
+}
+
+const DEFAULT_CAPABILITY_TTL_SECONDS = 60;
+const MAX_CAPABILITY_TTL_SECONDS = 300;
+const CAPABILITY_CLOCK_SKEW = 5;
+const NONCE_KEY_PREFIX = 'capability:nonce:';
+const REVOKED_SUBJECT_KEY_PREFIX = 'capability:revoked:sub:';
 
 /**
  * Authorization Policy Engine
@@ -963,6 +1054,283 @@ export class AuthorizationPolicyService {
       return true;
     }
   }
+
+  // ----------------------------------------------------------------------------
+  // PREWAVE-BE-082: Capability Tokens
+  // ----------------------------------------------------------------------------
+
+  /**
+   * Issue a signed, short-lived capability token.
+   * Authentication alone grants no capability; a token must be explicitly issued.
+   */
+  async issueCapabilityToken(
+    request: CapabilityIssueRequest,
+  ): Promise<CapabilityToken> {
+    this.assertRequiredString(request.aud, 'aud');
+    this.assertRequiredString(request.sub, 'sub');
+    this.assertRequiredString(request.cap, 'cap');
+
+    if (!Object.values(ResourceType).includes(request.resource)) {
+      throw new CapabilityTokenError('resource_invalid', 'Unknown resource type');
+    }
+    if (!Object.values(ActionType).includes(request.action)) {
+      throw new CapabilityTokenError('action_invalid', 'Unknown action type');
+    }
+
+    const ttl = this.resolveTtl(request.ttlSeconds);
+    const now = Math.floor(Date.now() / 1000);
+
+    const context = this.resolveContext(request);
+
+    const claims: CapabilityTokenClaims = {
+      ver: 1,
+      aud: request.aud,
+      sub: request.sub,
+      cap: request.cap,
+      resource: request.resource,
+      resourceId: request.resourceId,
+      action: request.action,
+      nonce: randomBytes(16).toString('hex'),
+      iat: now,
+      exp: now + ttl,
+      chain: context.chain,
+      release: context.release,
+      deployment: context.deployment,
+      artifact: context.artifact,
+    };
+
+    const signature = this.signClaims(claims);
+
+    this.logger.log(
+      `issued capability token aud=${claims.aud} sub=${claims.sub} cap=${claims.cap} ` +
+        `resource=${claims.resource} action=${claims.action} nonce=${claims.nonce} exp=${claims.exp}`,
+    );
+
+    return { claims, signature };
+  }
+
+  /**
+   * Validate and consume a capability token.
+   * Fails closed on any mismatch, expiry, replay, or revocation.
+   */
+  async useCapabilityToken(request: CapabilityUseRequest): Promise<void> {
+    const { token } = request;
+    if (!token || !token.claims || typeof token.signature !== 'string') {
+      this.auditUse('malformed', request);
+      throw new CapabilityTokenError('malformed', 'Malformed capability token');
+    }
+
+    const claims = token.claims;
+
+    // Signature verification first (fail closed).
+    if (!this.verifySignature(claims, token.signature)) {
+      this.auditUse('bad-signature', request);
+      throw new CapabilityTokenError('bad_signature', 'Invalid token signature');
+    }
+
+    if (claims.ver !== 1) {
+      this.auditUse('bad-version', request);
+      throw new CapabilityTokenError('bad_version', 'Unsupported token version');
+    }
+
+    // Audience / subject / capability binding.
+    if (claims.aud !== request.aud) {
+      this.auditUse('wrong-aud', request);
+      throw new CapabilityTokenError('wrong_aud', 'Token audience mismatch');
+    }
+    if (claims.sub !== request.sub) {
+      this.auditUse('wrong-sub', request);
+      throw new CapabilityTokenError('wrong_sub', 'Token subject mismatch');
+    }
+    if (claims.cap !== request.cap) {
+      this.auditUse('wrong-cap', request);
+      throw new CapabilityTokenError('wrong_cap', 'Token capability mismatch');
+    }
+
+    // Resource scope binding.
+    if (claims.resource !== request.resource) {
+      this.auditUse('wrong-resource', request);
+      throw new CapabilityTokenError('wrong_resource', 'Token resource mismatch');
+    }
+    if ((claims.resourceId ?? undefined) !== (request.resourceId ?? undefined)) {
+      this.auditUse('wrong-resource-id', request);
+      throw new CapabilityTokenError('wrong_resource_id', 'Token resource id mismatch');
+    }
+    if (claims.action !== request.action) {
+      this.auditUse('wrong-action', request);
+      throw new CapabilityTokenError('wrong_action', 'Token action mismatch');
+    }
+
+    // Chain/release/deployment/artifact context binding.
+    const ctx = this.resolveContext(request);
+    if (claims.chain !== ctx.chain) {
+      this.auditUse('wrong-chain', request);
+      throw new CapabilityTokenError('wrong_chain', 'Token chain context mismatch');
+    }
+    if (claims.release !== ctx.release) {
+      this.auditUse('wrong-release', request);
+      throw new CapabilityTokenError('wrong_release', 'Token release context mismatch');
+    }
+    if (claims.deployment !== ctx.deployment) {
+      this.auditUse('wrong-deployment', request);
+      throw new CapabilityTokenError('wrong_deployment', 'Token deployment context mismatch');
+    }
+    if (claims.artifact !== ctx.artifact) {
+      this.auditUse('wrong-artifact', request);
+      throw new CapabilityTokenError('wrong_artifact', 'Token artifact context mismatch');
+    }
+
+    // Temporal validity.
+    const now = Math.floor(Date.now() / 1000);
+    if (typeof claims.exp !== 'number' || typeof claims.iat !== 'number') {
+      this.auditUse('bad-temporal', request);
+      throw new CapabilityTokenError('bad_temporal', 'Token temporal claims invalid');
+    }
+    if (claims.exp - claims.iat > MAX_CAPABILITY_TTL_SECONDS) {
+      this.auditUse('ttl-too-long', request);
+      throw new CapabilityTokenError('ttl_too_long', 'Token lifetime exceeds maximum');
+    }
+    if (now > claims.exp + CAPABILITY_CLOCK_SKEW) {
+      this.auditUse('expired', request);
+      throw new CapabilityTokenError('expired', 'Token has expired');
+    }
+    if (now + CAPABILITY_CLOCK_SKEW < claims.iat) {
+      this.auditUse('not-yet-valid', request);
+      throw new CapabilityTokenError('not_yet_valid', 'Token is not yet valid');
+    }
+
+    // Revocation check (fail closed).
+    const revoked = await this.redisService.get(
+      `${REVOKED_SUBJECT_KEY_PREFIX}${claims.sub}`,
+    );
+    if (revoked) {
+      this.auditUse('revoked-subject', request);
+      throw new CapabilityTokenError('revoked', 'Token subject has been revoked');
+    }
+
+    // Replay protection: atomically claim the nonce.
+    const nonceKey = `${NONCE_KEY_PREFIX}${claims.nonce}`;
+    const ttl = Math.max(1, claims.exp - now + CAPABILITY_CLOCK_SKEW);
+    const claimed = await this.redisService.setIfNotExists(nonceKey, '1', ttl);
+    if (!claimed) {
+      this.auditUse('replay', request);
+      throw new CapabilityTokenError('replay', 'Token has already been used');
+    }
+
+    this.auditUse('ok', request);
+  }
+
+  /**
+   * Revoke all capability tokens for a subject.
+   */
+  async revokeSubject(sub: string, ttlSeconds?: number): Promise<void> {
+    this.assertRequiredString(sub, 'sub');
+    const ttl = this.resolveTtl(ttlSeconds);
+    await this.redisService.set(
+      `${REVOKED_SUBJECT_KEY_PREFIX}${sub}`,
+      '1',
+      ttl,
+    );
+    this.logger.log(`revoked capability tokens for subject=${sub}`);
+  }
+
+  private resolveTtl(ttlSeconds?: number): number {
+    const requested = ttlSeconds ?? undefined;
+    if (requested === undefined) {
+      return DEFAULT_CAPABILITY_TTL_SECONDS;
+    }
+    if (!Number.isFinite(requested) || requested <= 0) {
+      throw new CapabilityTokenError('bad_ttl', 'TTL must be a positive number');
+    }
+    return Math.min(Math.floor(requested), MAX_CAPABILITY_TTL_SECONDS);
+  }
+
+  private resolveContext(request: {
+    chain?: string;
+    release?: string;
+    deployment?: string;
+    artifact?: string;
+  }): { chain: string; release: string; deployment: string; artifact: string } {
+    const chain = request.chain ?? '';
+    const release = request.release ?? '';
+    const deployment = request.deployment ?? '';
+    const artifact = request.artifact ?? '';
+    if (!chain || !release || !deployment || !artifact) {
+      throw new CapabilityTokenError(
+        'missing_context',
+        'Chain, release, deployment, and artifact context are required',
+      );
+    }
+    return { chain, release, deployment, artifact };
+  }
+
+  private assertRequiredString(value: unknown, field: string): void {
+    if (typeof value !== 'string' || value.length === 0) {
+      throw new CapabilityTokenError(
+        'missing_field',
+        `Required field '${field}' is missing`,
+      );
+    }
+  }
+
+  private getSigningKey(): string {
+    const key = this.configService.get<string>('CAPABILITY_TOKEN_SIGNING_KEY');
+    if (!key) {
+      throw new CapabilityTokenError(
+        'missing_signing_key',
+        'Capability token signing key is not configured',
+      );
+    }
+    return key;
+  }
+
+  private canonicalizeClaims(claims: CapabilityTokenClaims): string {
+    return JSON.stringify({
+      ver: claims.ver,
+      aud: claims.aud,
+      sub: claims.sub,
+      cap: claims.cap,
+      resource: claims.resource,
+      resourceId: claims.resourceId ?? null,
+      action: claims.action,
+      nonce: claims.nonce,
+      iat: claims.iat,
+      exp: claims.exp,
+      chain: claims.chain,
+      release: claims.release,
+      deployment: claims.deployment,
+      artifact: claims.artifact,
+    });
+  }
+
+  private signClaims(claims: CapabilityTokenClaims): string {
+    return createHmac('sha256', this.getSigningKey())
+      .update(this.canonicalizeClaims(claims))
+      .digest('hex');
+  }
+
+  private verifySignature(claims: CapabilityTokenClaims, signature: string): boolean {
+    try {
+      const expected = this.signClaims(claims);
+      const a = Buffer.from(expected, 'hex');
+      const b = Buffer.from(signature, 'hex');
+      if (a.length !== b.length) {
+        return false;
+      }
+      return timingSafeEqual(a, b);
+    } catch {
+      return false;
+    }
+  }
+
+  private auditUse(outcome: string, request: CapabilityUseRequest): void {
+    const claims = request.token?.claims;
+    this.logger.log(
+      `capability token use outcome=${outcome} aud=${request.aud} sub=${request.sub} ` +
+        `cap=${request.cap} resource=${request.resource} action=${request.action} ` +
+        `nonce=${claims?.nonce ?? '-'}`,
+    );
+  }
 }
 
 /**
@@ -1000,5 +1368,53 @@ export class AuthorizationGuard implements CanActivate {
       throw new ForbiddenException('Insufficient permissions');
     }
     return true;
+  }
+}
+
+/**
+ * Guard that requires a valid capability token on the request.
+ */
+@Injectable()
+export class CapabilityTokenGuard implements CanActivate {
+  constructor(
+    private readonly reflector: Reflector,
+    private readonly policyService: AuthorizationPolicyService,
+  ) {}
+
+  async canActivate(context: ExecutionContext): Promise<boolean> {
+    const request = context.switchToHttp().getRequest();
+    const requirement = this.reflector.get<{
+      aud: string;
+      cap: string;
+      resource: ResourceType;
+      action: ActionType;
+    }>('capability', context.getHandler());
+    if (!requirement) {
+      throw new ForbiddenException('Capability requirement missing');
+    }
+    const token = request.body?.capabilityToken as CapabilityToken | undefined;
+    const sub = request.user?.id as string | undefined;
+    if (!token || !sub) {
+      throw new ForbiddenException('Missing capability token or subject');
+    }
+    try {
+      await this.policyService.useCapabilityToken({
+        token,
+        aud: requirement.aud,
+        sub,
+        cap: requirement.cap,
+        resource: requirement.resource,
+        resourceId: request.params?.id as string | undefined,
+        action: requirement.action,
+        chain: request.body?.chain,
+        release: request.body?.release,
+        deployment: request.body?.deployment,
+        artifact: request.body?.artifact,
+      });
+      return true;
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'Capability token rejected';
+      throw new ForbiddenException(message);
+    }
   }
 }
