@@ -30,6 +30,11 @@ import {
   ClaimPaginationSort,
   PaginatedClaimsResult,
 } from './claims.pagination.types';
+import {
+  SecretScannerService,
+  SecretScanResult,
+} from './secret-scanner.service';
+import { SecretQuarantineException } from './exceptions/secret-quarantine.exception';
 
 const CLAIMS_PAGINATION_ROUTE = 'claims.list';
 const CLAIMS_PAGINATION_SCHEMA_VERSION = 1;
@@ -49,6 +54,7 @@ export class ClaimsService {
     private readonly redisService: RedisService,
     private readonly auditTrailService: AuditTrailService,
     private readonly cursorService: CursorService,
+    private readonly secretScannerService: SecretScannerService,
   ) {}
 
   /**
@@ -62,7 +68,7 @@ export class ClaimsService {
     } catch (error) {
       if (error instanceof CacheUnavailableException) {
         this.logger.warn(
-          `Cache unavailable for claim ${id}, serving from database: ${error.message}`,
+          ` Cache unavailable for claim ${id}, serving from database: ${error.message}`,
         );
         // Fall through to database fetch - cache failure is isolated from canonical state
       } else {
@@ -140,7 +146,7 @@ export class ClaimsService {
       }
     }
 
-    // Get claim IDs from user stakes
+    // Get claim IFs from user stakes
     const stakes = await this.stakeRepo.find({
       where: { walletAddress: wallet },
     });
@@ -150,7 +156,7 @@ export class ClaimsService {
 
     const claims = await this.claimRepo
       .createQueryBuilder('claim')
-      .where('claim.id IN (:...ids)', { ids: claimIds })
+      .where('claim.id IN (:ids)', { ids: claimIds })
       .orderBy('claim.createdAt', 'DESC')
       .getMany();
 
@@ -318,6 +324,36 @@ export class ClaimsService {
       );
     }
 
+    // Scan support submission for secrets before any persistence or forwarding.
+    // High-confidence secrets are quarantined and never echoed into logs or errors.
+    const scanResult: SecretScanResult = this.secretScannerService.scanSupportSubmission({
+      title: createClaimDto.title,
+      content: createClaimDto.content,
+      metadata: (createClaimDto as any).metadata,
+      attachments: (createClaimDto as any).attachments,
+    });
+
+    if (scanResult.blocked) {
+      // Quarantine access is restricted and audited. Only metadata about the
+      // findings (kind/count) -- never the secret material itself -- is recorded.
+      await this.auditTrailService.log({
+        actionType: AuditActionType.CLAIM_SECRET_QUARANTINED,
+        entityType: AuditEntityType.CLAIM,
+        entityId: scanResult.quarantineId,
+        description: `Support submission quarantined: ${scanResult.findings.length} finding(s), highest confidence ${scanResult.highestConfidence}`,
+        afterState: {
+          quarantineId: scanResult.quarantineId,
+          findingKinds: scanResult.findings.map((f) => f.kind),
+        },
+      });
+
+      this.logger.warn(
+        `Support submission quarantined ${scanResult.quarantineId} with ${scanResult.findings.length} finding(s); secret material withheld.`,
+      );
+
+      throw new SecretQuarantineException(scanResult.quarantineId);
+    }
+
     // Check if a claim with the same content already exists
     // This helps prevent duplicates even without idempotency keys
     const existingClaim = await this.claimRepo.findOne({
@@ -375,5 +411,103 @@ export class ClaimsService {
     }
 
     return savedClaim;
+  }
+
+  /**
+   * Resolve a claim (update verdict and confidence)
+   * Uses state machine validation to ensure valid transitions
+   */
+  async resolveClaim(
+    claimId: string,
+    verdict: boolean,
+    confidenceScore: number,
+    userId?: string,
+  ): Promise<Claim> {
+    const claim = await this.findOne(claimId);
+    if (!claim) throw new NotFoundException(`Claim ${claimId} not found`);
+
+    const beforeState = { ...claim };
+
+    // Use transitionTo helper for validated state transition
+    // transitionTo sets resolvedAt on the claim entity when first resolved
+    claim.transitionTo(ClaimState.RESOLVED, {
+      verdict,
+      confidence: confidenceScore,
+    });
+
+    // Guard: reject if the object is somehow in an inconsistent state
+    // before we write (e.g. caller mutated fields directly).
+    assertResolvedAtInvariant(claim);
+
+    const updatedClaim = await this.claimRepo.save(claim);
+    // Invalidate both the claim-specific cache and the latest claims list cache (non-critical)
+    try {
+      await this.claimsCache.invalidateClaim(claimId);
+    } catch (error) {
+      if (error instanceof CacheUnavailableException) {
+        this.logger.warn(
+          `Cache unavailable for claim invalidation ${claimId}, skipping: ${error.message}`,
+        );
+        // Continue - cache failure is isolated from canonical state
+      } else {
+        throw error;
+      }
+    }
+
+    // Log the resolution
+    await this.auditTrailService.log( {
+      actionType: AuditActionType.CLAIM_RESOLVED,
+      entityType: AuditEntityType.CLAIM,
+      entityId: claimId,
+      userId,
+      description: `Claim resolved with verdict: ${verdict}, confidence: ${confidenceScore}`,
+      beforeState,
+      afterState: updatedClaim,
+    });
+
+    return updatedClaim;
+  }
+
+  /**
+   * Finalize a claim
+   * Uses state machine validation to ensure valid transitions
+   */
+  async finalizeClaim(claimId: string, userId?: string): Promise<Claim> {
+    const claim = await this.findOne(claimId);
+    if (!claim) throw new Error(`Claim ${claimId} not found`);
+
+    const beforeState = { ...claim };
+
+    // Use transitionTo helper for validated state transition
+    // transitionTo preserves resolvedAt if already set (RESOLVED → FINALIZED path)
+    claim.transitionTo(ClaimState.FINALIZED);
+
+    const updatedClaim = await this.claimRepo.save(claim);
+    // Invalidate both the claim-specific cache and the latest claims list cache (non-critical)
+    try {
+      await this.claimsCache.invalidateClaim(claimId);
+    } catch (error) {
+      if (error instanceof CacheUnavailableException) {
+        this.logger.warn(
+          `Cache unavailable for claim invalidation ${claimId}, skipping: ${error.message}`,
+        );
+        // Continue - cache failure is isolated from canonical state
+      } else {
+        throw error;
+      }
+    }
+
+    // Log the finalization
+    await this.auditTrailService.log( {
+      actionType: AuditActionType.CLAIM_FINALIZED,
+      entityType: AuditEntityType.CLAIM,
+      entityId: claimId,
+      userId,
+      description: 'Claim finalized',
+      beforeState,
+      afterState: updatedClaim,
+    });
+
+    return updatedClaim;
   }
 }
