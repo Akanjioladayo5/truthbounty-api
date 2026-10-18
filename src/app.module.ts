@@ -370,6 +370,7 @@ async function createThrottlerStorage(
     IndexerModule,
     V2OutboxModule,
     CredentialRotationModule,
+    // UX-BE-004 (#59
     OperationsModule,
     AbuseSignalsModule,
     // PREWAVE-BE-058: inbound webhook signature verification
@@ -386,6 +387,10 @@ async function createThrottlerStorage(
     {
       provide: APP_GUARD,
       useClass: IdempotencyGuard,
+    },
+    {
+      provide: APP_INTERCEPTOR,
+      useClass: AuditLoggingInterceptor,
     },
     {
       provide: APP_INTERCEPTOR,
