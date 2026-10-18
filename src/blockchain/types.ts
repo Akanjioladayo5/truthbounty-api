@@ -194,111 +194,238 @@ export interface ResolutionConfig {
 }
 
 /**
- * Realtime configuration and topic authorization types
- * (PREWAVE-BE-035)
+ * Protocol binding and release authority types.
+ *
+ * All chain-derived data must be bound to chain ID, release ID, deployment block,
+ * and artifact checksum so that missing, stale, ambiguous, or wrong-release
+ * data fails closed.
  */
 
-/**
- * Public data policy for a stream topic. Protected payloads require a
- * capability and are never coalesced with public payloads.
- */
-export type RealtimeTopicVisibility = 'public' | 'protected';
-
-/**
- * Supported release binding for realtime streams. Streams must be bound to
- * a chain ID, release ID, deployment block, and artifact checksum.
- */
-export interface RealtimeReleaseBinding {
-  chainId: string;
-  releaseId: string;
+export interface ChainReleaseBinding {
+  /**
+   * Numeric chain ID of the network the data was derived from (e.g. Optimism Sepolia).
+   */
+  chainId: number;
+  /** Numeric deployment block number of the authoritative contracts. */
   deploymentBlock: number;
+  /** Content address of the deployment artifact for this release. */
+  deploymentAddress: string;
+  /** Stable release identifier (canonical release ID). */
+  releaseId: string;
+  /** Hash of the deployment artifact manifest (checksum). */
+  artifactChecksum: string;
+}
+
+export type DataFreshness = 'fresh' | 'stale';
+
+export type DataAvailability = 'available' | 'unavailable';
+
+/**
+ * State of a projection with respect to authoritative chain data.
+ * These states are mutually exclusive and fail closed: only 'ok' permits
+ * consumers to treat the projection as authoritative.
+ */
+export type ProjectionStatus =
+  | 'ok'
+  | 'unavailable'
+  | 'ineligible'
+  | 'stale'
+  | 'wrong-release';
+
+/**
+ * Reason codes for non-ok projection states. Stable for client consumption.
+ */
+export type ProjectionReasonCode =
+  | 'missing-chain-data'
+  | 'missing-release-binding'
+  | 'chain-id-mismatch'
+  | 'release-id-mismatch'
+  | 'deployment-block-mismatch'
+  | 'artifact-checksum-mismatch'
+  | 'pre-deployment-block'
+  | 'not-registered'
+  | 'stake-below-minimum'
+  | 'reputation-below-minimum'
+  | 'verifier-inactive'
+  | 'verifier-slashed'
+  | 'assignment-missing'
+  | 'assignment-mismatch'
+  | 'phase-closed'
+  | 'deadline-passed'
+  | 'stale-projection-head'
+  | 'reorg-detected'
+  | 'finality-lag-exceeded'
+  | 'unknown';
+
+/**
+ * Provenance for a single chain-derived value. Every authoritative number on
+ * a projection must reference its source so consumers can verify it.
+ */
+export interface SourceReference {
+  /** Canonical event type that produced the value. */
+  eventType: string;
+  /** Transaction hash of the canonical event. */
+  transactionHash: string;
+  /** Log index within the transaction. */
+  logIndex: number;
+  /** Block number of the canonical event. */
+  blockNumber: number;
+  /** Block hash of the canonical event. */
+  blockHash: string;
+  /** Chain ID the event was observed on. */
+  chainId: number;
+  /** Release ID the event was observed under. */
+  releaseId: string;
+  /** Artifact checksum of the deployment that emitted the event. */
   artifactChecksum: string;
 }
 
 /**
- * A single approved stream topic definition.
+ * Stake input for a verifier, derived from canonical contract state.
  */
-export interface RealtimeTopicDefinition {
-  /** Canonical topic name. Must match the strict topic pattern. */
-  name: string;
-  /** Public or protected visibility. */
-  visibility: RealtimeTopicVisibility;
-  /** Capabilities required to subscribe (empty for public topics). */
-  requiredCapabilities: string[];
-  /** Maximum permitted payload size in bytes for this topic. */
-  maxPayloadBytes: number;
-  /** Retention window in seconds for backfill/replay. */
-  retentionSeconds: number;
-  /** Heartbeat interval in seconds. */
-  heartbeatSeconds: number;
+export interface VerifierStakeInput {
+  /** Staked amount as a BigInt string. */
+  amount: string;
+  /** Minimum stake required for eligibility as a BigInt string. */
+  minimumRequired: string;
+  /** Whether the stake meets the minimum. */
+  meetsMinimum: boolean;
+  /** Source of the stake value. */
+  source: SourceReference;
 }
 
 /**
- * Stream origin allow-list entry. Origins are matched exactly; wildcards
- * are not permitted.
+ * Reputation input for a verifier, derived from canonical contract state.
  */
-export interface RealtimeOriginAllowEntry {
-  origin: string;
-  /** Optional capabilities required to connect from this origin. */
-  requiredCapabilities?: string[];
+export interface VerifierReputationInput {
+  /** Reputation score as a BigInt string. */
+  score: string;
+  /** Minimum reputation required for eligibility as a BigInt string. */
+  minimumRequired: string;
+  /** Whether the reputation meets the minimum. */
+  meetsMinimum: boolean;
+  /** Source of the reputation value. */
+  source: SourceReference;
 }
 
 /**
- * Validated realtime configuration. Invalid config must fail startup/readiness.
+ * Effective weight provenance. The effective weight must always carry the
+ * authoritative source references for the stake and reputation inputs that
+ * contributed to it.
  */
-export interface RealtimeConfig {
-  /** Release binding the config to a chain/release/deployment/artifact. */
-  release: RealtimeReleaseBinding;
-  /** Approved stream topics. */
-  topics: RealtimeTopicDefinition[];
-  /** Allowed stream origins. */
-  origins: RealtimeOriginAllowEntry[];
-  /** Default heartbeat interval in seconds (topic overrides allowed). */
-  defaultHeartbeatSeconds: number;
-  /** Default retention window in seconds (topic overrides allowed). */
-  defaultRetentionSeconds: number;
-  /** Global maximum payload size in bytes. */
-  maxPayloadBytes: number;
-  /** Maximum number of subscriptions per session. */
-  maxSubscriptionsPerSession: number;
-  /** Maximum number of concurrent sessions per principal. */
-  maxSessionsPerPrincipal: number;
-  /** Supported release IDs. Config releaseID must be in this list. */
-  supportedReleaseIds: string[];
+export interface EffectiveWeightProvenance {
+  /** Computed effective weight as a BigInt string. */
+  weight: string;
+  /** Stake input used in the weight computation. */
+  stake: VerifierStakeInput;
+  /** Reputation input used in the weight computation. */
+  reputation: VerifierReputationInput;
+  /** Source of the weight computation ruleset (contract event). */
+  source: SourceReference;
 }
 
 /**
- * Principal subscription context used for topic authorization.
+ * Verifier readiness projection. Derived from canonical contract state.
  */
-export interface RealtimePrincipal {
-  principalId: string;
-  capabilities: string[];
-  /** Session revocation timestamp; revoked sessions must be rejected. */
-  revokedAt?: Date | null;
+export interface VerifierReadiness {
+  verifierId: string;
+  status: ProjectionStatus;
+  reasonCode?: ProjectionReasonCode;
+  /** Whether the verifier is registered in the authority contract. */
+  registered: boolean;
+  /** Whether the verifier is currently active. */
+  active: boolean;
+  /** Whether the verifier has been slashed. */
+  slashed: boolean;
+  /** Stake input and provenance. */
+  stake: VerifierStakeInput;
+  /** Reputation input and provenance. */
+  reputation: VerifierReputationInput;
+  /** Effective weight provenance. */
+  effectiveWeight: EffectiveWeightProvenance;
+  /** Chain/release binding for this projection. */
+  binding: ChainReleaseBinding;
+  /** Freshness of the underlying chain data. */
+  freshness: DataFreshness;
+  /** Block number of the last canonical event applied to this projection. */
+  projectionHeadBlock: number;
+  /** ISO timestamp the projection was derived. */
+  derivedAt: string;
 }
 
 /**
- * Result of authorizing a topic subscription request.
+ * Phase of a claim verification cycle, derived from canonical contract state.
  */
-export type RealtimeTopicAuthorizationResult =
-  | { ok: true; topic: RealtimeTopicDefinition }
-  | { ok: false; reason: RealtimeTopicAuthorizationFailureReason };
-
-export type RealtimeTopicAuthorizationFailureReason =
-  |'unknown_topic'
-  | 'wildcard_not_allowed'
-  | 'invalid_topic_name'
-  | 'missing_capability'
-  | 'revoked_session'
-  | 'origin_not_allowed'
-  | 'stale_release';
+export type VerificationPhase =
+  | 'unassigned'
+  | 'assigned'
+  | 'commitment'
+  | 'reveal'
+  | 'closed'
+  | 'settled';
 
 /**
- * Result of validating a payload against the authorized topic and config.
+ * Deadline projection for a phase. All values originate from canonical
+ * contract state.
  */
-export type RealtimePayloadValidationResult =
-  | { ok: true }
-  | { ok: false; reason: 'oversized_payload' | 'visibility_mismatch' };
+export interface PhaseDeadline {
+  phase: VerificationPhase;
+  /** Deadline as a Unix timestamp (seconds). */
+  deadlineTimestamp: number;
+  /** Whether the deadline has passed as of derivation. */
+  passed: boolean;
+  /** Source of the deadline value. */
+  source: SourceReference;
+}
+
+/**
+ * Assignment projection for a verifier on a claim.
+ */
+export interface VerifierAssignment {
+  claimId: string;
+  verifierId: string;
+  status: ProjectionStatus;
+  reasonCode?: ProjectionReasonCode;
+  /** Whether the verifier is assigned to the claim. */
+  assigned: boolean;
+  /** Source of the assignment. */
+  source: SourceReference;
+}
+
+/**
+ * Commitment projection. Exposes only the existence of a commitment and its
+ * source — never the commitment hash precontents or rationale.
+ */
+export interface CommitmentProjection {
+  claimId: string;
+  verifierId: string;
+  status: ProjectionStatus;
+  reasonCode?: ProjectionReasonCode;
+  /** Whether a commitment has been recorded for this verifier/claim. */
+  committed: boolean;
+  /** Source of the commitment existence (not its preimage). */
+  source: SourceReference;
+}
+
+/**
+ * Reveal requirement projection. Determines whether a verifier must reveal
+ * and whether they have revealed. Does not expose the revealed verdict or stake
+ * until canonical reveal is finalized.
+ */
+export interface RevealRequirementProjection {
+  claimId: string;
+  verifierId: string;
+  status: ProjectionStatus;
+  reasonCode?: ProjectionReasonCode;
+  /** Whether a reveal is required for this verifier/claim. */
+  required: boolean;
+  /** Whether the reveal has been recorded canonically. */
+  revealed: boolean;
+  /** Whether the reveal requirement was missed (deadline passed, no reveal). */
+  missed: boolean;
+  /** Source of the reveal requirement and state. */
+  source: SourceReference;
+}
 
 /**
  * Realtime Backpressure and SlowConsumer Isolation Types
