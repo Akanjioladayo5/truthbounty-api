@@ -37,6 +37,8 @@ export class CanonicalEventsService {
    * (unregistered address, unknown signature, decode error, artifact drift,
    * duplicate, success) is represented explicitly in the return type so
    * callers/tests can assert on it rather than inferring it from side effects.
+   * 
+   * Events are now keyed by canonical signature/topic0 for overload support.
    */
   async ingest(log: RawLog): Promise<IngestOutcome> {
     const resolved = await this.artifacts.resolve(log.chainId, log.address);
@@ -44,7 +46,7 @@ export class CanonicalEventsService {
       await this.quarantine(
         log,
         QuarantineReason.UNREGISTERED_ADDRESS,
-        null,
+        log.topics[0] ?? null,
         'no approved artifact for this address',
       );
       return {
@@ -58,7 +60,7 @@ export class CanonicalEventsService {
       await this.quarantine(
         log,
         QuarantineReason.UNKNOWN_SIGNATURE,
-        log.topics[0] ?? null,
+        decoded.topic0,
         'topic0 matched no fragment in approved ABI',
       );
       return {
@@ -70,7 +72,7 @@ export class CanonicalEventsService {
       await this.quarantine(
         log,
         QuarantineReason.DECODE_ERROR,
-        log.topics[0] ?? null,
+        decoded.topic0,
         decoded.error,
       );
       return { status: 'quarantined', reason: QuarantineReason.DECODE_ERROR };
@@ -80,12 +82,13 @@ export class CanonicalEventsService {
       log,
       resolved.artifactVersion,
       decoded.description,
+      decoded.signature,
     );
     if (normalized.status === 'artifact_drift') {
       await this.quarantine(
         log,
         QuarantineReason.ARTIFACT_DRIFT,
-        log.topics[0] ?? null,
+        decoded.topic0,
         `decoded event "${normalized.eventName}" has no canonical schema mapping`,
       );
       this.logger.warn(
@@ -101,6 +104,7 @@ export class CanonicalEventsService {
           contractAddress: normalized.event.contractAddress,
           artifactVersion: normalized.event.artifactVersion,
           eventName: normalized.event.eventName,
+          eventSignature: normalized.event.eventSignature,
           txHash: normalized.event.txHash,
           logIndex: normalized.event.logIndex,
           blockNumber: normalized.event.blockNumber.toString(),

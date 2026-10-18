@@ -11,29 +11,45 @@ import { WeightedVoteResolutionService } from './weighted-vote-resolution.servic
 import { SybilResistanceModule } from '../sybil-resistance/sybil-resistance.module';
 import { StartupValidationService } from './startup-validation.service';
 import { DeterministicRpcFailoverService } from './deterministic-rpc-failover.service';
+import { ReadinessService } from './readiness.service';
+import { DependencyProvenanceService } from './dependency-provenance.service';
+import { WebhookSignatureService } from './webhook-signature.service';
+import { WebhookReplayGuardService } from './webhook-replay-guard.service';
+import { WebhookDeliveryEntity } from './entities/webhook-delivery.entity';
+import { WebhookController } from './webhook.controller';
 
 @Module({
   imports: [
-    TypeOrmModule.forFeature([ProcessedEvent, TokenBalance, IndexerCheckpoint]),
+    TypeOrmModule.forFeature([ProcessedEvent, TokenBalance, IndexerCheckpoint, WebhookDeliveryEntity]),
     SybilResistanceModule,
   ],
   providers: [
     BlockchainIndexerService,
     BlockchainStateService,
+    ReadinessService,
+    DependencyProvenanceService,
     ReorgDetectorService,
     ReconciliationService,
     EventIndexingService,
     StartupValidationService,
     DeterministicRpcFailoverService,
+    WeightedVoteResolutionService,
+    WebhookSignatureService,
+    WebhookReplayGuardService,
   ],
-  controllers: [BlockchainController],
+  controllers: [BlockchainController, WebhookController],
   exports: [
     BlockchainIndexerService,
     BlockchainStateService,
+    ReadinessService,
+    DependencyProvenanceService,
     ReorgDetectorService,
     ReconciliationService,
     EventIndexingService,
     DeterministicRpcFailoverService,
+    WeightedVoteResolutionService,
+    WebhookSignatureService,
+    WebhookReplayGuardService,
   ],
 })
 export class BlockchainModule {}

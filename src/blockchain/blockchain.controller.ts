@@ -1,10 +1,24 @@
-import { Controller, Get, Post, Body, Param } from '@nestjs/common';
+import {
+  Controller,
+  Get,
+  Post,
+  Body,
+  Param,
+  Headers,
+  Req,
+  HttpCode,
+  HttpException,
+  UnauthorizedException,
+} from '@nestjs/common';
 import { ApiTags } from '@nestjs/swagger';
+import { Request } from 'express';
 import { EventIndexingService } from './event-indexing.service';
 import { ReconciliationService } from './reconciliation.service';
 import { BlockchainStateService } from './state.service';
 import { WeightedVoteResolutionService } from './weighted-vote-resolution.service';
+import { ReadinessService } from './readiness.service';
 import { BlockInfo, ResolutionConfig, VerificationVote } from './types';
+import { WebhookSignatureService } from './webhook-signature.service';
 
 @ApiTags('blockchain')
 @Controller('api/v1/blockchain')
@@ -14,6 +28,8 @@ export class BlockchainController {
     private reconciliation: ReconciliationService,
     private stateService: BlockchainStateService,
     private voteResolver: WeightedVoteResolutionService,
+    private readinessService: ReadinessService,
+    private webhookSignatureService: WebhookSignatureService,
   ) {}
 
   /**
@@ -37,6 +53,44 @@ export class BlockchainController {
   }
 
   /**
+   * Receive and verify an inbound provider webhook.
+   * Raw signed bytes are preserved via raw body parsing and verified before
+   * any deserialization or side effect. Replays are rejected transactionally.
+   */
+  @Post('webhooks/:provider')
+  @HttpCode(200)
+  async handleWebhook(
+    @Param('provider') provider: string,
+    @Headers() headers: Record<string, string | string[] | undefined>,
+    @Req() req: Request,
+  ) {
+    const rawBody: Buffer = Buffer.isBuffer(req.body)
+      ? req.body
+      : Buffer.from(req.body === undefined ? '' : String(req.body), 'utf8');
+
+    try {
+      const result = await this.webhookSignatureService.verifyAndIngest(
+        provider,
+        headers,
+        rawBody,
+      );
+
+      return {
+        success: true,
+        provider,
+        deliveryId: result.deliveryId,
+        received: true,
+      };
+    } catch (error) {
+      // Fail closed. Never leak secrets or signature details in responses or logs.
+      if (error instanceof HttpException) {
+        throw error;
+      }
+      throw new UnauthorizedException('Webhook rejected');
+    }
+  }
+
+  /**
    * Get indexing statistics
    */
   @Get('indexing/stats')
@@ -50,6 +104,22 @@ export class BlockchainController {
   @Get('chain/state')
   async getChainState() {
     return this.stateService.getChainState();
+  }
+
+  /**
+   * Get readiness snapshot (internal, detailed).
+   */
+  @Get('readiness')
+  async getReadiness() {
+    return this.readinessService.evaluate();
+  }
+
+  /**
+   * Get sanitized public readiness snapshot.
+   */
+  @Get('readiness/public')
+  async getPublicReadiness() {
+    return this.readinessService.getPublicSnapshot();
   }
 
   /**
