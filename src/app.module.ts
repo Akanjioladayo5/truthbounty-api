@@ -49,6 +49,7 @@ import { V2DisputesModule } from './v2/disputes/v2-disputes.module';
 import { ChainEventsModule } from './v2/chain-events/chain-events.module';
 import { BlockCursorModule } from './v2/block-cursor/block-cursor.module';
 import { V2RewardsModule } from './v2/rewards/v2-rewards.module';
+import { V2StakingModule } from './v2/staking/v2-staking.module';
 import { V2RebuildModule } from './v2/rebuild/v2-rebuild.module';
 import { V2ProjectionModule } from './v2/projection/v2-projection.module';
 import { ProfilerModule } from './profiler/profiler.module';
@@ -360,6 +361,7 @@ async function createThrottlerStorage(
     ChainEventsModule,
     BlockCursorModule,
     V2RewardsModule,
+    V2StakingModule,
     V2RebuildModule,
     V2ProjectionModule,
     ProfilerModule,
