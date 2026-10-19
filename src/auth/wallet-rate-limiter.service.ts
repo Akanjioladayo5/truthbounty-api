@@ -2,7 +2,11 @@ import { Injectable, Logger, Inject, Optional } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { RedisService } from '../redis/redis.service';
 import { REQUEST } from '@nestjs/core';
-import { Request } from 'express';
+import type { Request } from 'express';
+import {
+  AuthenticatedRequest,
+  isAuthenticatedRequest,
+} from './types/authenticated-request';
 
 /**
  * Wallet-Scoped and Endpoint-Cost Rate Limiter
@@ -113,7 +117,7 @@ export class WalletRateLimiterService {
     );
     const effectiveWindowMs = this.defaultConfig.windowMs;
 
-    const key = this.buildRateLimitKey(identity, req, tierConfig);
+    const key = this.buildRateLimitKey(identity, req);
 
     // Fail closed on Redis outage
     const isHealthy = await this.redisService.isHealthy();
@@ -172,16 +176,17 @@ export class WalletRateLimiterService {
     let isTrusted = false;
     let trustScore = 50;
 
-    if (req.user) {
-      const user = req.user as any;
-      walletAddress = user.address?.toLowerCase();
-      userId = user.sub || user.userId;
-
-      if (user.trustLevel) {
-        const tier = this.walletTierLimits.get(user.trustLevel);
-        if (tier) {
+    // Only trust the principal attached by the verified JWT strategy.
+    // Anonymous requests must not inherit stale identity from any other source.
+    if (isAuthenticatedRequest(req)) {
+      const principal = (req as AuthenticatedRequest).user;
+      if (principal) {
+        walletAddress = principal.address.toLowerCase();
+        userId = principal.userId ?? principal.sub;
+        const role = principal.user?.role;
+        if (role && this.walletTierLimits.has(role)) {
           isTrusted = true;
-          trustScore = user.trustScore || 75;
+          trustScore = 75;
         }
       }
     }
@@ -191,7 +196,8 @@ export class WalletRateLimiterService {
       walletAddress = headerWallet.toLowerCase();
     }
 
-    const apiKey = req.headers?.['x-api-key'] as string;
+    const apiKeyRaw = req.headers?.['x-api-key'];
+    const apiKey = typeof apiKeyRaw === 'string' ? apiKeyRaw : undefined;
     if (apiKey) {
       const apiKeyTrust = await this.getApiKeyTrustLevel(apiKey);
       if (apiKeyTrust) {
@@ -217,8 +223,16 @@ export class WalletRateLimiterService {
   }
 
   private getEndpointCost(req: Request): number {
+    if (typeof (req as any).rateLimitCost === 'number') {
+      return (req as any).rateLimitCost;
+    }
+
     const path = req.path || '';
     const method = req.method || 'GET';
+
+    if (path.startsWith('/search')) {
+      return this.calculateSearchCost(req);
+    }
 
     for (const endpoint of this.endpointCosts) {
       const pathMatches = typeof endpoint.path === 'string'
@@ -235,6 +249,41 @@ export class WalletRateLimiterService {
     return 1;
   }
 
+  public calculateSearchCost(req: Request): number {
+    const path = req.path || '';
+    const query = (req.query || {}) as Record<string, any>;
+
+    // Global search queries 3 entities, entity-specific queries 1
+    let cost = path === '/search' || path === '/search/' ? 5 : 2;
+
+    const q = typeof query.q === 'string' ? query.q.trim() : '';
+    if (q) {
+      const terms = q.split(/\s+/).filter(Boolean);
+      if (terms.length > 3) {
+        cost += 1;
+      }
+    }
+
+    const limit = query.limit ? Number(query.limit) : 20;
+    if (limit > 50) {
+      cost += 2;
+    } else if (limit > 20) {
+      cost += 1;
+    }
+
+    let filterCount = 0;
+    for (const key of ['status', 'owner', 'walletAddress', 'fromDate', 'toDate', 'finalized']) {
+      if (query[key] !== undefined && query[key] !== '') {
+        filterCount++;
+      }
+    }
+    if (filterCount > 1) {
+      cost += 1;
+    }
+
+    return cost;
+  }
+
   private getTierConfig(identity: WalletIdentity): { multiplier: number; burstAllowance: number } {
     if (identity.walletAddress) {
       if (identity.trustScore >= 90) return this.walletTierLimits.get('premium')!;
@@ -245,8 +294,8 @@ export class WalletRateLimiterService {
     return this.walletTierLimits.get('new')!;
   }
 
-  private buildRateLimitKey(identity: WalletIdentity, req: Request, tierConfig: any): string {
-    const parts = [this.defaultConfig.keyPrefix];
+  private buildRateLimitKey(identity: WalletIdentity, req: Request): string {
+    const parts = [this.defaultConfig.keyPrefix as string];
 
     if (identity.walletAddress) {
       parts.push('wallet', identity.walletAddress);
@@ -275,11 +324,11 @@ export class WalletRateLimiterService {
     const scaledCost = Math.max(1, Math.round(endpointCost * 10));
 
     const luaScript = `
-      local current = redis.call('INCRBY', KEYS[1], ARGV[2])
-      if current == tonumber(ARGV[2]) then
-        redis.call('PEXPIRE', KEYS[1], ARGV[1])
+      local current = redis.call('INCRBY', KEYS[1], ARG[2])
+      if current == tonumber(ARG[2]) then
+        redis.call('PEXPIRE', KEY[1], ARG[1])
       end
-      local ttl = redis.call('PTTL', KEYS[1])
+      local ttl = redis.call('PTTL', KEY[1])
       return {current, ttl}
     `;
 
@@ -292,8 +341,9 @@ export class WalletRateLimiterService {
       const totalHits = scaledTotalHits / 10;
       return { totalHits, resetTime };
     } catch (error) {
-      this.logger.error(`Redis increment failed: ${error.message}. Failing closed.`);
-      throw new Error(`Rate limit Redis failure (Fail Closed): ${error.message}`);
+      const message = error instanceof Error ? error.message : String(error);
+      this.logger.error(`Redis increment failed: ${message}. Failing closed.`);
+      throw new Error(`Rate limit Redis failure (Fail Closed): ${message}`);
     }
   }
 
@@ -357,17 +407,18 @@ export class WalletRateLimiterService {
   }> {
     const tierConfig = this.getTierConfig(identity);
     const effectiveMaxRequests = Math.floor(this.defaultConfig.maxRequests * tierConfig.multiplier);
-    const key = this.buildRateLimitKey(identity, req, tierConfig);
+    const key = this.buildRateLimitKey(identity, req);
     const windowStart = Date.now() - (Date.now() % this.defaultConfig.windowMs);
     const windowKey = `${key}:${windowStart}`;
 
-    const currentUsage = parseInt((await this.redisService.get(windowKey)) || '0', 10) / 10;
+    const current = await this.redisService.get(windowKey);
+    const currentUsage = current ? Number(current) / 10 : 0;
 
     return {
       currentUsage,
       limit: effectiveMaxRequests,
       resetTime: windowStart + this.defaultConfig.windowMs,
-      tier: identity.walletAddress ? 'wallet' : 'ip',
+      tier: identity.walletAddress ? 'authenticated' : 'anonymous',
     };
   }
 }

@@ -27,6 +27,8 @@ import { JobsModule } from './jobs/jobs.module';
 import { CacheModule } from './cache/cache.module';
 import { ClaimsModule } from './claims/claims.module';
 import { ClaimFeedModule } from './claims/v2/claim-feed.module';
+import { ClaimReadModelsModule } from './claims/v2/read-models/claim-read-models.module';
+import { DisputeReadModelsModule } from './v2/disputes/read-models/dispute-read-models.module';
 import { AuditModule } from './audit/audit.module';
 import { ThemeModule } from './theme.module';
 import { SupportModule } from './support/support.module';
@@ -48,6 +50,7 @@ import { V2DisputesModule } from './v2/disputes/v2-disputes.module';
 import { ChainEventsModule } from './v2/chain-events/chain-events.module';
 import { BlockCursorModule } from './v2/block-cursor/block-cursor.module';
 import { V2RewardsModule } from './v2/rewards/v2-rewards.module';
+import { V2StakingModule } from './v2/staking/v2-staking.module';
 import { V2RebuildModule } from './v2/rebuild/v2-rebuild.module';
 import { V2ProjectionModule } from './v2/projection/v2-projection.module';
 import { ProfilerModule } from './profiler/profiler.module';
@@ -62,6 +65,11 @@ import { IndexerModule } from './indexer/indexer.module';
 import { V2OutboxModule } from './v2/outbox/v2-outbox.module';
 import { CredentialRotationModule } from './security/credential-rotation.module';
 import { OperationsModule } from './operations/operations.module';
+import { WebhooksModule } from './webhooks/webhooks.module';
+import { NotificationsModule as OutboundWebhooksNotificationsModule } from './notifications/notifications.module';
+import { AbuseSignalsModule } from './abuse-signals/abuse-signals.module';
+import { AbuseSignalInterceptor } from './abuse-signals/abuse-signal.interceptor';
+import { WebhooksModule } from './webhooks/webhooks.module';
 
 // In-memory storage for development (no Redis needed)
 class ThrottlerMemoryStorage {
@@ -177,11 +185,11 @@ class ThrottlerRedisStorage {
     const blockKey = `${key}:blocked`;
     const [blocked, blockTimeToExpire] = await Promise.all([
       this.redis.exists(blockKey),
-      this.redis.pttl(blockKey),
+      this.redis.ptl(blockKey),
     ]);
 
     if (blocked) {
-      const timeToExpire = await this.redis.pttl(key);
+      const timeToExpire = await this.redis.ptl(key);
       return {
         totalHits: await this.redis
           .get(key)
@@ -192,12 +200,12 @@ class ThrottlerRedisStorage {
       };
     }
 
-    const [totalHits, existingTtl] = await Promise.all([
+    const [totalHits, existingTll] = await Promise.all([
       this.redis.incr(key),
-      this.redis.pttl(key),
+      this.redis.ptl(key),
     ]);
 
-    let timeToExpire = existingTtl;
+    let timeToExpire = existingTll;
     if (timeToExpire === -1 || timeToExpire === -2) {
       await this.redis.pexpire(key, ttl);
       timeToExpire = ttl;
@@ -259,7 +267,7 @@ async function createThrottlerStorage(
     } catch (error) {
       const logger = new Logger('ThrottlerModule');
       logger.warn(
-        `Redis connection failed, falling back to memory storage: ${error}`,
+        `Redis connection failed, falling back to memory storage: ${error} `,
       );
       return new ThrottlerMemoryStorage();
     }
@@ -338,6 +346,10 @@ async function createThrottlerStorage(
     CacheModule,
     ClaimsModule,
     ClaimFeedModule,
+    // PREWAVE-BE-005: versioned claim list/detail read models
+    ClaimReadModelsModule,
+    // PREWAVE-BE-007: versioned dispute register/detail read models
+    DisputeReadModelsModule,
     AuditModule,
     ThemeModule,
     SupportModule,
@@ -354,6 +366,7 @@ async function createThrottlerStorage(
     ChainEventsModule,
     BlockCursorModule,
     V2RewardsModule,
+    V2StakingModule,
     V2RebuildModule,
     V2ProjectionModule,
     ProfilerModule,
@@ -362,11 +375,13 @@ async function createThrottlerStorage(
     RealtimeModule,
     StakingModule,
     IndexerModule,
-    // V2-BE-113: TypeORM-side Transactional Outbox
     V2OutboxModule,
     CredentialRotationModule,
-    // UX-BE-004 (#595): protected operations, safe-retry and audit interfaces
+    // UX-BE-004 (#59
     OperationsModule,
+    AbuseSignalsModule,
+    // PREWAVE-BE-058: inbound webhook signature verification
+    WebhooksModule,
   ],
   controllers: [AppController],
   providers: [
@@ -378,11 +393,15 @@ async function createThrottlerStorage(
     },
     {
       provide: APP_GUARD,
-      useClass: WalletThrottlerGuard,
+      useClass: IdempotencyGuard,
     },
     {
-      provide: APP_GUARD,
-      useClass: IdempotencyGuard,
+      provide: APP_INTERCEPTOR,
+      useClass: AuditLoggingInterceptor,
+    },
+    {
+      provide: APP_INTERCEPTOR,
+      useClass: AuditLoggingInterceptor,
     },
     {
       provide: APP_INTERCEPTOR,
@@ -391,6 +410,10 @@ async function createThrottlerStorage(
     {
       provide: APP_INTERCEPTOR,
       useClass: ProfilerInterceptor,
+    },
+    {
+      provide: APP_INTERCEPTOR,
+      useClass: AbuseSignalInterceptor,
     },
   ],
 })
